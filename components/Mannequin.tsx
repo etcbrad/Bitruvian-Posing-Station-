@@ -5,6 +5,252 @@ import { Bone } from './Bone';
 import { ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT, RIGGING } from '../constants';
 import { WalkingEnginePose, WalkingEngineProportions, WalkingEnginePivotOffsets, Vector2D, MaskTransform, JointMode } from '../types';
 
+// Helper functions for vector math, copied from App.tsx for Mannequin's internal calculations.
+const rotateVec = (vec: Vector2D, angleDeg: number): Vector2D => {
+  const r = angleDeg * Math.PI / 180;
+  const c = Math.cos(r);
+  const s = Math.sin(r);
+  return { x: vec.x * c - vec.y * s, y: vec.x * s + vec.y * c };
+};
+const addVec = (v1: Vector2D, v2: Vector2D): Vector2D => ({ x: v1.x + v2.x, y: v1.y + v2.y });
+// const subVec = (v1: Vector2D, v2: Vector2D): Vector2D => ({ x: v1.x - v2.x, y: v1.y - v2.y }); // Not currently used but kept for consistency if needed
+
+// Exported helper function for App.tsx to get current world transforms for IK
+export function getMannequinWorldTransformsHelper(
+  pivotOffsets: WalkingEnginePivotOffsets,
+  props: WalkingEngineProportions,
+  baseUnitH: number,
+  isReversed: boolean,
+  jointModes?: Record<keyof WalkingEnginePivotOffsets, JointMode>,
+): Partial<Record<keyof WalkingEngineProportions | 'headJoint' | 'collarJoint' | 'waistJoint' | 'torsoJoint' | 'collarEndPoint', { position: Vector2D; rotation: number, length?: number }>> {
+    const trans: Partial<Record<keyof WalkingEngineProportions | 'headJoint' | 'collarJoint' | 'waistJoint' | 'torsoJoint' | 'collarEndPoint', { position: Vector2D; rotation: number, length?: number }>> = {};
+
+    const getScaledDimension = (raw: number, key: keyof WalkingEngineProportions, axis: 'w' | 'h') => {
+        return raw * baseUnitH * (props[key]?.[axis] || 1);
+    };
+
+    const calculateJointRotation = (boneKey: string, parentRot: number) => {
+        const local = (pivotOffsets[boneKey as keyof WalkingEnginePivotOffsets] || 0);
+        const mode = jointModes?.[boneKey as keyof WalkingEnginePivotOffsets] || 'standard';
+        
+        switch(mode) {
+            case 'bend': return parentRot + (local * 1.5);
+            case 'stretch': return parentRot + (local * 0.5);
+            default: return parentRot + local;
+        }
+    };
+
+    if (!isReversed) {
+        // --- Standard Hierarchy (Waist as Root) ---
+        // Waist
+        const waistLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.WAIST, 'waist', 'h');
+        const waistRot = calculateJointRotation('waist', 0);
+        trans.waist = { position: { x: 0, y: 0 }, rotation: waistRot, length: waistLen }; // Root position
+        trans.waistJoint = { position: { x: 0, y: 0 }, rotation: waistRot, length: waistLen }; // Joint at start of waist
+
+        // Torso
+        const torsoLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TORSO, 'torso', 'h');
+        const torsoRot = calculateJointRotation('torso', waistRot);
+        const torsoPos = addVec(trans.waist.position, rotateVec({ x: 0, y: -waistLen }, waistRot));
+        trans.torso = { position: torsoPos, rotation: torsoRot, length: torsoLen };
+        trans.torsoJoint = { position: torsoPos, rotation: torsoRot, length: torsoLen }; // Joint at start of torso
+
+        // Collar
+        const collarLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.COLLAR, 'collar', 'h');
+        const collarRot = calculateJointRotation('collar', torsoRot);
+        const collarPos = addVec(trans.torso.position, rotateVec({ x: 0, y: -torsoLen }, torsoRot));
+        trans.collar = { position: collarPos, rotation: collarRot, length: collarLen };
+        trans.collarJoint = { position: collarPos, rotation: collarRot, length: collarLen };
+        
+        const collarEndPoint = addVec(trans.collar.position, rotateVec({ x: 0, y: -collarLen }, collarRot));
+        trans.collarEndPoint = { position: collarEndPoint, rotation: collarRot }; // Useful for arm roots
+
+        // Head (Neck is boneKey)
+        const neckRot = calculateJointRotation('neck', collarRot);
+        const headPos = addVec(trans.collar.position, rotateVec({ x: 0, y: -collarLen }, collarRot));
+        trans.head = { position: headPos, rotation: neckRot, length: getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.HEAD, 'head', 'h') };
+        trans.headJoint = { position: headPos, rotation: neckRot }; // Joint at start of head
+
+        // Arms (Children of collar)
+        ['r', 'l'].forEach(side => {
+            const shBoneKey = `${side}_shoulder` as keyof WalkingEnginePivotOffsets;
+            const upArmPropKey = `${side}_upper_arm` as keyof WalkingEngineProportions;
+            const elBoneKey = `${side}_elbow` as keyof WalkingEnginePivotOffsets;
+            const lowArmPropKey = `${side}_lower_arm` as keyof WalkingEngineProportions;
+            const handBoneKey = `${side}_hand` as keyof WalkingEnginePivotOffsets;
+            const handPropKey = `${side}_hand` as keyof WalkingEngineProportions;
+
+            const sx = (side === 'r' ? RIGGING.R_SHOULDER_X_OFFSET_FROM_COLLAR_CENTER : RIGGING.L_SHOULDER_X_OFFSET_FROM_COLLAR_CENTER) * baseUnitH;
+            
+            // Shoulder (start of upper arm) - positioned relative to collar's *end* point
+            const shJointPos = addVec(collarEndPoint, rotateVec({ x: sx, y: 0 }, collarRot)); // World position of shoulder joint
+            
+            // Upper Arm
+            const shRot = calculateJointRotation(shBoneKey, collarRot + (side === 'l' ? 90 : -90)); // Shoulder local rotation relative to collar (horizontal)
+            const upLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.UPPER_ARM, upArmPropKey, 'h');
+            trans[upArmPropKey] = { position: shJointPos, rotation: shRot, length: upLen };
+
+            // Elbow (start of lower arm)
+            const elJointPos = addVec(shJointPos, rotateVec({ x: 0, y: upLen }, shRot)); // World position of elbow joint
+            
+            // Lower Arm
+            const elRot = calculateJointRotation(elBoneKey, shRot);
+            const lowLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LOWER_ARM, lowArmPropKey, 'h');
+            trans[lowArmPropKey] = { position: elJointPos, rotation: elRot, length: lowLen };
+
+            // Hand (start of hand)
+            const handJointPos = addVec(elJointPos, rotateVec({ x: 0, y: lowLen }, elRot)); // World position of hand joint
+            
+            // Hand
+            const handRot = calculateJointRotation(handBoneKey, elRot);
+            const handLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.HAND, handPropKey, 'h');
+            trans[handPropKey] = { position: handJointPos, rotation: handRot, length: handLen };
+        });
+
+        // Legs (Children of waist)
+        ['r', 'l'].forEach(side => {
+            const hipBoneKey = `${side}_hip` as keyof WalkingEnginePivotOffsets;
+            const upLegPropKey = `${side}_upper_leg` as keyof WalkingEngineProportions;
+            const kneeBoneKey = `${side}_knee` as keyof WalkingEnginePivotOffsets;
+            const lowLegPropKey = `${side}_lower_leg` as keyof WalkingEnginePivotOffsets; // Corrected type
+            const footBoneKey = `${side}_foot` as keyof WalkingEnginePivotOffsets;
+            const footPropKey = `${side}_foot` as keyof WalkingEngineProportions;
+            const toeBoneKey = `${side}_toe` as keyof WalkingEnginePivotOffsets;
+            const toePropKey = `${side}_toe` as keyof WalkingEngineProportions;
+
+            // Hip (start of upper leg) - positioned relative to waist's *start* point
+            const hipJointPos = trans.waist.position; // World position of hip joint (same as waist joint)
+
+            // Upper Leg (Thigh)
+            const hipRot = calculateJointRotation(hipBoneKey, waistRot + 180); // Hip local rotation relative to waist (downwards)
+            const thighLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LEG_UPPER, upLegPropKey, 'h');
+            trans[upLegPropKey] = { position: hipJointPos, rotation: hipRot, length: thighLen };
+
+            // Knee (start of lower leg)
+            const kneeJointPos = addVec(hipJointPos, rotateVec({ x: 0, y: thighLen }, hipRot)); // World position of knee joint
+            
+            // Lower Leg (Calf)
+            const kneeRot = calculateJointRotation(kneeBoneKey, hipRot);
+            const calfLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LEG_LOWER, lowLegPropKey, 'h');
+            trans[lowLegPropKey] = { position: kneeJointPos, rotation: kneeRot, length: calfLen };
+
+            // Ankle/Foot (start of foot)
+            const ankleJointPos = addVec(kneeJointPos, rotateVec({ x: 0, y: calfLen }, kneeRot)); // World position of ankle/foot joint
+            
+            // Foot
+            const ankleRot = calculateJointRotation(footBoneKey, kneeRot);
+            const footLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.FOOT, footPropKey, 'h');
+            trans[footPropKey] = { position: ankleJointPos, rotation: ankleRot, length: footLen };
+
+            // Toe (start of toe)
+            const toeJointPos = addVec(ankleJointPos, rotateVec({ x: 0, y: footLen }, ankleRot)); // World position of toe joint
+            
+            // Toe
+            const toeRot = calculateJointRotation(toeBoneKey, ankleRot);
+            const toeLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TOE, toePropKey, 'h');
+            trans[toePropKey] = { position: toeJointPos, rotation: toeRot, length: toeLen };
+        });
+    } else {
+        // --- Reversed Hierarchy (Head as Root) ---
+        // Head (Neck is boneKey)
+        const neckRot = calculateJointRotation('neck', 0);
+        trans.head = { position: { x: 0, y: 0 }, rotation: neckRot, length: getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.HEAD, 'head', 'h') };
+        trans.headJoint = { position: { x: 0, y: 0 }, rotation: neckRot };
+        
+        // Collar
+        const collarLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.COLLAR, 'collar', 'h');
+        const collarRot = calculateJointRotation('collar', neckRot);
+        const collarPos = addVec(trans.head.position, rotateVec({ x: 0, y: collarLen }, neckRot));
+        trans.collar = { position: collarPos, rotation: collarRot, length: collarLen };
+        trans.collarJoint = { position: collarPos, rotation: collarRot, length: collarLen };
+        
+        const collarEndPoint = addVec(trans.collar.position, rotateVec({ x: 0, y: collarLen }, collarRot)); // Note y direction
+        trans.collarEndPoint = { position: collarEndPoint, rotation: collarRot }; // Useful for arm roots
+
+        // Torso
+        const torsoLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TORSO, 'torso', 'h');
+        const torsoRot = calculateJointRotation('torso', collarRot);
+        const torsoPos = addVec(trans.collar.position, rotateVec({ x: 0, y: collarLen }, collarRot));
+        trans.torso = { position: torsoPos, rotation: torsoRot, length: torsoLen };
+        trans.torsoJoint = { position: torsoPos, rotation: torsoRot, length: torsoLen };
+        
+        // Waist
+        const waistLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.WAIST, 'waist', 'h');
+        const waistRot = calculateJointRotation('waist', torsoRot);
+        const waistPos = addVec(trans.torso.position, rotateVec({ x: 0, y: torsoLen }, torsoRot));
+        trans.waist = { position: waistPos, rotation: waistRot, length: waistLen };
+        trans.waistJoint = { position: waistPos, rotation: waistRot, length: waistLen };
+
+        // Arms (Children of collar)
+        ['r', 'l'].forEach(side => {
+            const shBoneKey = `${side}_shoulder` as keyof WalkingEnginePivotOffsets;
+            const upArmPropKey = `${side}_upper_arm` as keyof WalkingEngineProportions;
+            const elBoneKey = `${side}_elbow` as keyof WalkingEnginePivotOffsets;
+            const lowArmPropKey = `${side}_lower_arm` as keyof WalkingEngineProportions;
+            const handBoneKey = `${side}_hand` as keyof WalkingEnginePivotOffsets;
+            const handPropKey = `${side}_hand` as keyof WalkingEngineProportions;
+
+            const sx = (side === 'r' ? RIGGING.R_SHOULDER_X_OFFSET_FROM_COLLAR_CENTER : RIGGING.L_SHOULDER_X_OFFSET_FROM_COLLAR_CENTER) * baseUnitH;
+            
+            const shJointPos = addVec(collarEndPoint, rotateVec({ x: sx, y: 0 }, collarRot));
+            
+            const shRot = calculateJointRotation(shBoneKey, collarRot + (side === 'l' ? 90 : -90));
+            const upLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.UPPER_ARM, upArmPropKey, 'h');
+            trans[upArmPropKey] = { position: shJointPos, rotation: shRot, length: upLen };
+
+            const elJointPos = addVec(shJointPos, rotateVec({ x: 0, y: upLen }, shRot));
+            
+            const elRot = calculateJointRotation(elBoneKey, shRot);
+            const lowLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LOWER_ARM, lowArmPropKey, 'h');
+            trans[lowArmPropKey] = { position: elJointPos, rotation: elRot, length: lowLen };
+
+            const handJointPos = addVec(elJointPos, rotateVec({ x: 0, y: lowLen }, elRot));
+            
+            const handRot = calculateJointRotation(handBoneKey, elRot);
+            const handLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.HAND, handPropKey, 'h');
+            trans[handPropKey] = { position: handJointPos, rotation: handRot, length: handLen };
+        });
+
+        // Legs (Children of waist)
+        ['r', 'l'].forEach(side => {
+            const hipBoneKey = `${side}_hip` as keyof WalkingEnginePivotOffsets;
+            const upLegPropKey = `${side}_upper_leg` as keyof WalkingEngineProportions;
+            const kneeBoneKey = `${side}_knee` as keyof WalkingEnginePivotOffsets;
+            const lowLegPropKey = `${side}_lower_leg` as keyof WalkingEngineProportions;
+            const footBoneKey = `${side}_foot` as keyof WalkingEnginePivotOffsets;
+            const footPropKey = `${side}_foot` as keyof WalkingEngineProportions;
+            const toeBoneKey = `${side}_toe` as keyof WalkingEnginePivotOffsets;
+            const toePropKey = `${side}_toe` as keyof WalkingEngineProportions;
+
+            const hipJointPos = trans.waist.position;
+
+            const hipRot = calculateJointRotation(hipBoneKey, waistRot + 180);
+            const thighLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LEG_UPPER, upLegPropKey, 'h');
+            trans[upLegPropKey] = { position: hipJointPos, rotation: hipRot, length: thighLen };
+
+            const kneeJointPos = addVec(hipJointPos, rotateVec({ x: 0, y: thighLen }, hipRot));
+            
+            const kneeRot = calculateJointRotation(kneeBoneKey, hipRot);
+            const calfLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LEG_LOWER, lowLegPropKey, 'h');
+            trans[lowLegPropKey] = { position: kneeJointPos, rotation: kneeRot, length: calfLen };
+
+            const ankleJointPos = addVec(kneeJointPos, rotateVec({ x: 0, y: calfLen }, kneeRot));
+            
+            const ankleRot = calculateJointRotation(footBoneKey, kneeRot);
+            const footLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.FOOT, footPropKey, 'h');
+            trans[footPropKey] = { position: ankleJointPos, rotation: ankleRot, length: footLen };
+
+            const toeJointPos = addVec(ankleJointPos, rotateVec({ x: 0, y: footLen }, ankleRot));
+            
+            const toeRot = calculateJointRotation(toeBoneKey, ankleRot);
+            const toeLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TOE, toePropKey, 'h');
+            trans[toePropKey] = { position: toeJointPos, rotation: toeRot, length: toeLen };
+        });
+    }
+    return trans;
+}
+
+
 interface MannequinProps {
   pose: WalkingEnginePose;
   pivotOffsets: WalkingEnginePivotOffsets & { l_hand_flash?: boolean; r_hand_flash?: boolean };
@@ -12,7 +258,7 @@ interface MannequinProps {
   showPivots: boolean;
   showLabels: boolean;
   baseUnitH: number;
-  onAnchorMouseDown: (boneKey: keyof WalkingEnginePivotOffsets, clientX: number) => void;
+  onAnchorMouseDown: (boneKey: keyof WalkingEnginePivotOffsets, clientX: number, clientY: number) => void;
   draggingBoneKey: keyof WalkingEnginePivotOffsets | null;
   isPaused: boolean;
   pinningMode: 'none' | 'rightFoot' | 'dual';
@@ -49,140 +295,21 @@ const partDefinitions: Record<keyof WalkingEngineProportions, any> = {
     l_toe: { rawH: ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TOE, rawW: ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TOE_WIDTH, variant: 'toe-rounded-cap', label: 'Toe', boneKey: 'l_toe' },
 };
 
-const rotateVec = (vec: Vector2D, angleDeg: number): Vector2D => {
-  const r = angleDeg * Math.PI / 180;
-  const c = Math.cos(r);
-  const s = Math.sin(r);
-  return { x: vec.x * c - vec.y * s, y: vec.x * s + vec.y * c };
-};
-const addVec = (v1: Vector2D, v2: Vector2D): Vector2D => ({ x: v1.x + v2.x, y: v1.y + v2.y });
-
-export const Mannequin: React.FC<MannequinProps> = ({
-  pose, pivotOffsets, props, showPivots, showLabels, baseUnitH,
+const Mannequin: React.FC<MannequinProps> = ({
+  pivotOffsets, props, showPivots, showLabels, baseUnitH,
   onAnchorMouseDown, draggingBoneKey, isPaused, pinningMode,
   maskImage, maskTransform, offset, isReversed, jointModes
 }) => {
+    // Helper function to calculate scaled dimensions for use in JSX
     const getScaledDimension = useCallback((raw: number, key: keyof WalkingEngineProportions, axis: 'w' | 'h') => {
         return raw * baseUnitH * (props[key]?.[axis] || 1);
-    }, [props, baseUnitH]);
-
-    // Fix: Use only pivotOffsets for joint rotations, as it is the dynamic state.
-    // The `pose` prop is treated as a base or for other attributes not currently used for rotations.
-    const calculateJointRotation = (boneKey: string, parentRot: number) => {
-        const local = ((pivotOffsets as any)[boneKey] || 0);
-        const mode = jointModes?.[boneKey as keyof WalkingEnginePivotOffsets] || 'standard';
-        
-        switch(mode) {
-            case 'bend': return parentRot + (local * 1.5); // Exaggerates local rotation for a more pronounced bend
-            case 'stretch': return parentRot + (local * 0.5); // Reduces local rotation's influence, making it straighter
-            default: return parentRot + local; // Standard FK
-        }
-    };
+    }, [baseUnitH, props]);
 
     const globalTransforms = useMemo(() => {
-        const trans: Partial<Record<keyof WalkingEngineProportions, { position: Vector2D; rotation: number }>> = {};
-        
-        if (!isReversed) {
-            // --- Standard Hierarchy (Waist as Root) ---
-            const waistLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.WAIST, 'waist', 'h');
-            const waistRot = calculateJointRotation('waist', 0);
-            trans.waist = { position: { x: 0, y: 0 }, rotation: waistRot };
-
-            const torsoLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TORSO, 'torso', 'h');
-            const torsoRot = calculateJointRotation('torso', waistRot);
-            trans.torso = { position: addVec(trans.waist.position, rotateVec({ x: 0, y: -waistLen }, waistRot)), rotation: torsoRot };
-
-            const collarLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.COLLAR, 'collar', 'h');
-            const collarRot = calculateJointRotation('collar', torsoRot);
-            trans.collar = { position: addVec(trans.torso.position, rotateVec({ x: 0, y: -torsoLen }, torsoRot)), rotation: collarRot };
-            
-            const neckRot = calculateJointRotation('neck', collarRot);
-            trans.head = { position: addVec(trans.collar.position, rotateVec({ x: 0, y: -collarLen }, collarRot)), rotation: neckRot };
-
-            // Arms and Legs follow collar and waist respectively
-            ['r', 'l'].forEach(side => {
-                const sx = (side === 'r' ? RIGGING.R_SHOULDER_X_OFFSET_FROM_COLLAR_CENTER : RIGGING.L_SHOULDER_X_OFFSET_FROM_COLLAR_CENTER) * baseUnitH;
-                // Arms are children of collar, their initial orientation is side-ways from collar's perspective
-                const shRot = calculateJointRotation(`${side}_shoulder`, collarRot + (side === 'l' ? 90 : -90)); 
-                const collarEnd = addVec(trans.collar!.position, rotateVec({ x: 0, y: -collarLen }, collarRot));
-                const shPos = addVec(collarEnd, rotateVec({ x: sx, y: 0 }, collarRot));
-                trans[`${side}_upper_arm` as keyof WalkingEngineProportions] = { position: shPos, rotation: shRot };
-                const upLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.UPPER_ARM, `${side}_upper_arm` as any, 'h');
-                const elRot = calculateJointRotation(`${side}_elbow`, shRot);
-                const elPos = addVec(shPos, rotateVec({ x: 0, y: upLen }, shRot));
-                trans[`${side}_lower_arm` as keyof WalkingEngineProportions] = { position: elPos, rotation: elRot };
-                const lowLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LOWER_ARM, `${side}_lower_arm` as any, 'h');
-                const handRot = calculateJointRotation(`${side}_hand`, elRot);
-                trans[`${side}_hand` as keyof WalkingEngineProportions] = { position: addVec(elPos, rotateVec({ x: 0, y: lowLen }, elRot)), rotation: handRot };
-            });
-
-            ['r', 'l'].forEach(side => {
-                // Legs start pointing downwards from the waist. Add 180 to hip rotation.
-                const hipRot = calculateJointRotation(`${side}_hip`, waistRot + 180); 
-                trans[`${side}_upper_leg` as keyof WalkingEngineProportions] = { position: trans.waist!.position, rotation: hipRot };
-                const thighLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LEG_UPPER, `${side}_upper_leg` as any, 'h');
-                const kneeRot = calculateJointRotation(`${side}_knee`, hipRot);
-                const kneePos = addVec(trans.waist!.position, rotateVec({ x: 0, y: thighLen }, hipRot));
-                trans[`${side}_lower_leg` as keyof WalkingEngineProportions] = { position: kneePos, rotation: kneeRot };
-                const calfLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LEG_LOWER, `${side}_lower_leg` as any, 'h');
-                const ankleRot = calculateJointRotation(`${side}_foot`, kneeRot);
-                const anklePos = addVec(kneePos, rotateVec({ x: 0, y: calfLen }, kneeRot));
-                trans[`${side}_foot` as keyof WalkingEngineProportions] = { position: anklePos, rotation: ankleRot };
-                const footLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.FOOT, `${side}_foot` as any, 'h');
-                const toeRot = calculateJointRotation(`${side}_toe`, ankleRot);
-                trans[`${side}_toe` as keyof WalkingEngineProportions] = { position: addVec(anklePos, rotateVec({ x: 0, y: footLen }, ankleRot)), rotation: toeRot };
-            });
-        } else {
-            // --- Reversed Hierarchy (Head as Root) ---
-            const neckRot = calculateJointRotation('neck', 0);
-            trans.head = { position: { x: 0, y: 0 }, rotation: neckRot };
-            
-            const collarLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.COLLAR, 'collar', 'h');
-            const collarRot = calculateJointRotation('collar', neckRot);
-            trans.collar = { position: addVec(trans.head.position, rotateVec({ x: 0, y: collarLen }, neckRot)), rotation: collarRot };
-            
-            const torsoLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TORSO, 'torso', 'h');
-            const torsoRot = calculateJointRotation('torso', collarRot);
-            trans.torso = { position: addVec(trans.collar.position, rotateVec({ x: 0, y: collarLen }, collarRot)), rotation: torsoRot };
-            
-            const waistLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.WAIST, 'waist', 'h');
-            const waistRot = calculateJointRotation('waist', torsoRot);
-            trans.waist = { position: addVec(trans.torso.position, rotateVec({ x: 0, y: torsoLen }, torsoRot)), rotation: waistRot };
-
-            // Arms and Legs follow the chain down
-            ['r', 'l'].forEach(side => {
-                const sx = (side === 'r' ? RIGGING.R_SHOULDER_X_OFFSET_FROM_COLLAR_CENTER : RIGGING.L_SHOULDER_X_OFFSET_FROM_COLLAR_CENTER) * baseUnitH;
-                const shRot = calculateJointRotation(`${side}_shoulder`, collarRot + (side === 'l' ? 90 : -90));
-                const shPos = addVec(trans.collar!.position, rotateVec({ x: sx, y: 0 }, collarRot));
-                trans[`${side}_upper_arm` as keyof WalkingEngineProportions] = { position: shPos, rotation: shRot };
-                const upLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.UPPER_ARM, `${side}_upper_arm` as any, 'h');
-                const elRot = calculateJointRotation(`${side}_elbow`, shRot);
-                const elPos = addVec(shPos, rotateVec({ x: 0, y: upLen }, shRot));
-                trans[`${side}_lower_arm` as keyof WalkingEngineProportions] = { position: elPos, rotation: elRot };
-                const lowLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LOWER_ARM, `${side}_lower_arm` as any, 'h');
-                const handRot = calculateJointRotation(`${side}_hand`, elRot);
-                trans[`${side}_hand` as keyof WalkingEngineProportions] = { position: addVec(elPos, rotateVec({ x: 0, y: lowLen }, elRot)), rotation: handRot };
-            });
-
-            ['r', 'l'].forEach(side => {
-                const hipRot = calculateJointRotation(`${side}_hip`, waistRot + 180); // Legs point downwards from waist in reversed mode too
-                trans[`${side}_upper_leg` as keyof WalkingEngineProportions] = { position: trans.waist!.position, rotation: hipRot };
-                const thighLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LEG_UPPER, `${side}_upper_leg` as any, 'h');
-                const kneeRot = calculateJointRotation(`${side}_knee`, hipRot);
-                const kneePos = addVec(trans.waist!.position, rotateVec({ x: 0, y: thighLen }, hipRot));
-                trans[`${side}_lower_leg` as keyof WalkingEngineProportions] = { position: kneePos, rotation: kneeRot };
-                const calfLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.LEG_LOWER, `${side}_lower_leg` as any, 'h');
-                const ankleRot = calculateJointRotation(`${side}_foot`, kneeRot);
-                const anklePos = addVec(kneePos, rotateVec({ x: 0, y: calfLen }, kneeRot));
-                trans[`${side}_foot` as keyof WalkingEngineProportions] = { position: anklePos, rotation: ankleRot };
-                const footLen = getScaledDimension(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.FOOT, `${side}_foot` as any, 'h');
-                const toeRot = calculateJointRotation(`${side}_toe`, ankleRot);
-                trans[`${side}_toe` as keyof WalkingEngineProportions] = { position: addVec(anklePos, rotateVec({ x: 0, y: footLen }, ankleRot)), rotation: toeRot };
-            });
-        }
-
-        return trans;
-    }, [pivotOffsets, getScaledDimension, baseUnitH, isReversed, jointModes]); // Changed `pose` to `pivotOffsets` in dependencies
+      return getMannequinWorldTransformsHelper(
+        pivotOffsets, props, baseUnitH, isReversed, jointModes
+      );
+    }, [pivotOffsets, props, baseUnitH, isReversed, jointModes]);
 
     return (
         <g>
@@ -199,8 +326,8 @@ export const Mannequin: React.FC<MannequinProps> = ({
                     <g key={partKey} transform={`translate(${t.position.x}, ${t.position.y}) rotate(${t.rotation})`}>
                         <Bone 
                             rotation={0}
-                            length={getScaledDimension(p.rawH, partKey, 'h')}
-                            width={getScaledDimension(p.rawW, partKey, 'w')}
+                            length={t.length || 0} // Use calculated length from globalTransforms for consistency
+                            width={getScaledDimension(p.rawW, partKey, 'w') || 0}
                             variant={p.variant}
                             drawsUpwards={p.drawsUpwards}
                             label={p.label}
@@ -220,3 +347,5 @@ export const Mannequin: React.FC<MannequinProps> = ({
         </g>
     );
 };
+
+export { Mannequin }; // Export the Mannequin component

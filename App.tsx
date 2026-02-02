@@ -1,8 +1,11 @@
+
+
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { WalkingEnginePose, WalkingEnginePivotOffsets, WalkingEngineProportions, Vector2D, MaskTransform, JointMode } from './types';
-import { ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT, RIGGING } from './constants'; 
-import { Mannequin } from './components/Mannequin';
+import { WalkingEnginePose, WalkingEnginePivotOffsets, WalkingEngineProportions, Vector2D, MaskTransform, JointMode, IKChainKey } from './types';
+import { ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT, RIGGING, RIGHT_ARM_IK_CONFIG, RIGHT_LEG_IK_CONFIG, LEFT_ARM_IK_CONFIG, LEFT_LEG_IK_CONFIG } from './constants'; 
+import { Mannequin, getMannequinWorldTransformsHelper } from './components/Mannequin'; // Import helper
 import { SystemLogger } from './components/SystemLogger';
+import { solveFABRIK } from './utils/fabrik'; // Import FABRIK solver
 
 const T_POSE: WalkingEnginePivotOffsets = {
   waist: 0, neck: 0, collar: 0, torso: 0,
@@ -101,6 +104,8 @@ const rotateVec = (vec: Vector2D, angleDeg: number): Vector2D => {
   return { x: vec.x * c - vec.y * s, y: vec.x * s + vec.y * c };
 };
 const addVec = (v1: Vector2D, v2: Vector2D): Vector2D => ({ x: v1.x + v2.x, y: v1.y + v2.y });
+const subVec = (v1: Vector2D, v2: Vector2D): Vector2D => ({ x: v1.x - v2.x, y: v1.y - v2.y });
+
 
 const App: React.FC = () => {
   const [showPivots, setShowPivots] = useState(true);
@@ -147,6 +152,10 @@ const App: React.FC = () => {
   const [globalBoneWidthMultiplier, setGlobalBoneWidthMultiplier] = useState(1);
   const [globalLimbLengthMultiplier, setGlobalLimbLengthMultiplier] = useState(1);
   const [mannequinOffsetY, setMannequinOffsetY] = useState(-50); // Adjusted dynamically for reversal
+
+  // FABRIK IK State
+  const [activeIKChain, setActiveIKChain] = useState<IKChainKey | null>(null);
+  const ikTargetWorldPosRef = useRef<Vector2D | null>(null); // For current IK drag target
 
   const [savedPoses, setSavedPoses] = useState<SavedPoseEntry[]>([]);
   const [anomaly, setAnomaly] = useState<Vector2D | null>(null);
@@ -255,22 +264,133 @@ const App: React.FC = () => {
     if (pinningMode !== 'none') updatePinOffset();
   }, [pivotOffsets, props, updatePinOffset]);
 
-  const handleDrag = useCallback((e: MouseEvent) => {
-    if (draggingBoneKey && !isTweening) {
-      lastInteractionTimeRef.current = Date.now();
+  const handleAnchorMouseDown = useCallback((boneKey: keyof WalkingEnginePivotOffsets, clientX: number, clientY: number, svgRef: SVGSVGElement | null) => {
+    if (activeIKChain && svgRef) {
+      const svgPoint = svgRef.createSVGPoint();
+      svgPoint.x = clientX;
+      svgPoint.y = clientY;
+      const CTM = svgRef.getScreenCTM();
+      if (CTM) {
+        const inverseCTM = CTM.inverse();
+        const transformedPoint = svgPoint.matrixTransform(inverseCTM);
+
+        // Adjust for mannequin's SVG offset (pinOffset.x, mannequinOffsetY + pinOffset.y)
+        const adjustedX = transformedPoint.x - pinOffset.x;
+        const adjustedY = transformedPoint.y - mannequinOffsetY - pinOffset.y;
+        
+        ikTargetWorldPosRef.current = { x: adjustedX, y: adjustedY };
+      }
+    }
+    setDraggingBoneKey(boneKey);
+    dragStartXRef.current = clientX;
+    dragStartPivotOffsetRef.current = pivotOffsets[boneKey];
+  }, [activeIKChain, pivotOffsets, pinOffset.x, pinOffset.y, mannequinOffsetY]);
+
+
+  const handleDrag = useCallback((e: MouseEvent, svgRef: SVGSVGElement | null) => {
+    lastInteractionTimeRef.current = Date.now();
+
+    if (activeIKChain && draggingBoneKey && svgRef) {
+      const svgPoint = svgRef.createSVGPoint();
+      svgPoint.x = e.clientX;
+      svgPoint.y = e.clientY;
+      const CTM = svgRef.getScreenCTM();
+
+      if (CTM) {
+        const inverseCTM = CTM.inverse();
+        const transformedPoint = svgPoint.matrixTransform(inverseCTM);
+
+        // Adjust for mannequin's SVG offset (pinOffset.x, mannequinOffsetY + pinOffset.y)
+        const adjustedX = transformedPoint.x - pinOffset.x;
+        const adjustedY = transformedPoint.y - mannequinOffsetY - pinOffset.y;
+
+        ikTargetWorldPosRef.current = { x: adjustedX, y: adjustedY };
+      }
+
+      let ikConfig;
+      let rootPart;
+      let rootRotation;
+      let endEffectorKey;
+
+      const currentGlobalTransforms = getMannequinWorldTransformsHelper(pivotOffsets, props, baseH, isReversed, jointModes);
+
+      if (activeIKChain === 'right_arm' && draggingBoneKey === RIGHT_ARM_IK_CONFIG.endEffectorBoneKey) {
+        ikConfig = RIGHT_ARM_IK_CONFIG;
+        rootPart = currentGlobalTransforms.collarEndPoint; // Collar's end for arm root
+        rootRotation = currentGlobalTransforms.collar?.rotation || 0;
+        endEffectorKey = RIGHT_ARM_IK_CONFIG.endEffectorBoneKey;
+      } else if (activeIKChain === 'left_arm' && draggingBoneKey === LEFT_ARM_IK_CONFIG.endEffectorBoneKey) {
+        ikConfig = LEFT_ARM_IK_CONFIG;
+        rootPart = currentGlobalTransforms.collarEndPoint; // Collar's end for arm root
+        rootRotation = currentGlobalTransforms.collar?.rotation || 0;
+        endEffectorKey = LEFT_ARM_IK_CONFIG.endEffectorBoneKey;
+      } else if (activeIKChain === 'right_leg' && draggingBoneKey === RIGHT_LEG_IK_CONFIG.endEffectorBoneKey) {
+        ikConfig = RIGHT_LEG_IK_CONFIG;
+        rootPart = currentGlobalTransforms.waistJoint; // Waist origin for leg root
+        rootRotation = currentGlobalTransforms.waist?.rotation || 0;
+        endEffectorKey = RIGHT_LEG_IK_CONFIG.endEffectorBoneKey;
+      } else if (activeIKChain === 'left_leg' && draggingBoneKey === LEFT_LEG_IK_CONFIG.endEffectorBoneKey) {
+        ikConfig = LEFT_LEG_IK_CONFIG;
+        rootPart = currentGlobalTransforms.waistJoint; // Waist origin for leg root
+        rootRotation = currentGlobalTransforms.waist?.rotation || 0;
+        endEffectorKey = LEFT_LEG_IK_CONFIG.endEffectorBoneKey;
+      }
+
+
+      if (ikConfig && rootPart && rootPart.position && ikTargetWorldPosRef.current) {
+        // Root position for FABRIK is the *actual joint location* (e.g., shoulder joint)
+        // Root rotation for FABRIK is the *world rotation of its parent* (e.g., collar rotation)
+
+        // Adjust root position to incorporate rootJointOffset relative to rootParentPropKey's position/rotation
+        const rootParentPartTransform = currentGlobalTransforms[ikConfig.rootParentPropKey];
+        if (!rootParentPartTransform?.position) {
+          console.error("FABRIK: Could not find root parent position for IK chain:", ikConfig.rootParentPropKey);
+          return;
+        }
+
+        const effectiveRootWorldPos = addVec(rootParentPartTransform.position, rotateVec(ikConfig.rootJointOffset, rootParentPartTransform.rotation));
+        const effectiveRootWorldRot = rootParentPartTransform.rotation + ikConfig.rootParentRotationOffset;
+
+
+        const newPivotOffsets = solveFABRIK(
+          ikConfig,
+          pivotOffsets,
+          props,
+          baseH,
+          effectiveRootWorldPos, // Root of the IK chain
+          effectiveRootWorldRot, // Parent rotation for the first bone
+          ikTargetWorldPosRef.current
+        );
+        setPivotOffsets(newPivotOffsets);
+        awardTokens(draggingBoneKey); // Award tokens for IK interaction
+      }
+      
+    } else if (draggingBoneKey && !isTweening) { // Standard FK drag
       const delta = (e.clientX - dragStartXRef.current) * 0.5;
       setPivotOffsets(p => ({ ...p, [draggingBoneKey]: dragStartPivotOffsetRef.current + delta }));
+      awardTokens(draggingBoneKey);
     }
-  }, [draggingBoneKey, isTweening]);
+  }, [draggingBoneKey, isTweening, activeIKChain, pivotOffsets, props, baseH, isReversed, jointModes, pinOffset.x, pinOffset.y, mannequinOffsetY, awardTokens]);
+
+  const svgRef = useRef<SVGSVGElement>(null);
 
   useEffect(() => {
-    const hu = () => { setDraggingBoneKey(null); draggingBoneKeyRef.current = null; };
+    const hu = () => { 
+      setDraggingBoneKey(null); 
+      draggingBoneKeyRef.current = null;
+      ikTargetWorldPosRef.current = null; // Clear IK target when drag ends
+    };
+    const moveHandler = (e: MouseEvent) => handleDrag(e, svgRef.current);
+
     if (draggingBoneKey) {
       draggingBoneKeyRef.current = draggingBoneKey;
-      window.addEventListener('mousemove', handleDrag);
+      window.addEventListener('mousemove', moveHandler);
       window.addEventListener('mouseup', hu);
     }
-    return () => { window.removeEventListener('mousemove', handleDrag); window.removeEventListener('mouseup', hu); };
+    return () => { 
+      window.removeEventListener('mousemove', moveHandler); 
+      window.removeEventListener('mouseup', hu); 
+    };
   }, [draggingBoneKey, handleDrag]);
 
   const setJointMode = (key: keyof WalkingEnginePivotOffsets, mode: JointMode) => {
@@ -281,6 +401,13 @@ const App: React.FC = () => {
     setJointModes(prev => ({ ...prev, [key]: nextMode }));
     addLog(`[SYSTEM]: JOINT_MODE_UPDATE - ${key.toUpperCase()} SET TO ${nextMode.toUpperCase()}`);
   };
+
+  const toggleIKChain = useCallback((chainKey: IKChainKey) => {
+    setLastPoppedKey(`ik-${chainKey}`);
+    setTimeout(() => setLastPoppedKey(null), 300);
+    setActiveIKChain(prev => (prev === chainKey ? null : chainKey));
+    addLog(`[SYSTEM]: IK_MODE - ${chainKey.toUpperCase()} ${activeIKChain === chainKey ? 'DEACTIVATED' : 'ACTIVATED'}`);
+  }, [activeIKChain, addLog]);
 
   const runTween = useCallback((target: SavedPoseEntry) => {
     if (isTweening) return;
@@ -348,45 +475,13 @@ const App: React.FC = () => {
 
   // Function to calculate a temporary Mannequin's global transforms for offset calculation
   const getMannequinGlobalTransforms = useCallback((reversed: boolean) => {
-    // This is a simplified version of Mannequin's globalTransforms for calculating the root position
-    // It uses current props and baseH, but the passed `reversed` flag.
-    const trans: Partial<Record<keyof WalkingEngineProportions, { position: Vector2D; rotation: number }>> = {};
-    const getScaledDim = (raw: number, key: keyof WalkingEngineProportions, axis: 'w' | 'h') => raw * baseH * (props[key]?.[axis] || 1);
-    // Fix: Reference currentPivotOffsets instead of an undefined 'pose'
-    const calculateRot = (boneKey: string, parentRot: number) => ((pivotOffsets as any)[boneKey] || 0) + parentRot;
-
-    if (!reversed) {
-        const waistLen = getScaledDim(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.WAIST, 'waist', 'h');
-        const waistRot = calculateRot('waist', 0);
-        trans.waist = { position: { x: 0, y: 0 }, rotation: waistRot };
-
-        const torsoLen = getScaledDim(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TORSO, 'torso', 'h');
-        const torsoRot = calculateRot('torso', waistRot);
-        trans.torso = { position: addVec(trans.waist.position, rotateVec({ x: 0, y: -waistLen }, waistRot)), rotation: torsoRot };
-    } else {
-        const neckRot = calculateRot('neck', 0);
-        trans.head = { position: { x: 0, y: 0 }, rotation: neckRot };
-        
-        const collarLen = getScaledDim(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.COLLAR, 'collar', 'h');
-        const collarRot = calculateRot('collar', neckRot);
-        trans.collar = { position: addVec(trans.head.position, rotateVec({ x: 0, y: collarLen }, neckRot)), rotation: collarRot };
-        
-        const torsoLen = getScaledDim(ANATOMY_RAW_RELATIVE_TO_BASE_HEAD_UNIT.TORSO, 'torso', 'h');
-        const torsoRot = calculateRot('torso', collarRot);
-        trans.torso = { position: addVec(trans.collar.position, rotateVec({ x: 0, y: collarLen }, collarRot)), rotation: torsoRot };
-    }
-    return trans;
-  }, [baseH, props, pivotOffsets]); // Added pivotOffsets to dependencies
+    // Uses the helper function from Mannequin to get the transforms
+    return getMannequinWorldTransformsHelper(pivotOffsets, props, baseH, reversed, jointModes);
+  }, [baseH, props, pivotOffsets, jointModes]);
 
   // Effect to adjust mannequinOffsetY when isReversed changes
   useEffect(() => {
     const currentTransforms = getMannequinGlobalTransforms(isReversed);
-    // Note: prevTransforms calculation here might be simplified or removed if only current is needed
-    // However, keeping it as is for now, assuming it computes correctly.
-    const prevTransforms = getMannequinGlobalTransforms(!isReversed);
-
-    const currentRootY = isReversed ? (currentTransforms.head?.position.y || 0) : (currentTransforms.waist?.position.y || 0);
-    const prevRootY = !isReversed ? (prevTransforms.head?.position.y || 0) : (prevTransforms.waist?.position.y || 0);
     
     // We want the primary visual anchor (e.g., torso center or average of head/waist) to stay consistent.
     // For simplicity, let's keep the `torso` (the main body part) in roughly the same visual Y position.
@@ -421,6 +516,7 @@ const App: React.FC = () => {
                     setGlobalScale(150);
                     setGlobalBoneWidthMultiplier(1);
                     setGlobalLimbLengthMultiplier(1);
+                    setActiveIKChain(null); // Deactivate IK on T-Pose
                   }} 
                   className={`text-[9px] px-3 py-2 border border-selection bg-selection text-paper font-bold uppercase transition-all hover:scale-[1.02] active:scale-[0.98] btn-pop ${lastPoppedKey === 't-pose' ? 'animate-pop' : ''}`}
                 >
@@ -446,6 +542,21 @@ const App: React.FC = () => {
                     </button>
                 </div>
                 <button onClick={() => setShowPivots(!showPivots)} className={`text-[9px] px-3 py-1 border transition-all ${showPivots ? 'bg-selection text-paper' : 'border-ridge'}`}>ANCHORS: {showPivots ? 'ON' : 'OFF'}</button>
+                
+                {/* IK Controls */}
+                <div className="text-[10px] uppercase font-bold text-ink pt-2 border-t border-ridge mt-2">IK Chains</div>
+                <div className="grid grid-cols-2 gap-2">
+                  {(['right_arm', 'left_arm', 'right_leg', 'left_leg'] as IKChainKey[]).map(chainKey => (
+                    <button 
+                      key={chainKey}
+                      onClick={() => toggleIKChain(chainKey)}
+                      className={`text-[9px] px-3 py-2 border transition-all font-bold uppercase hover:scale-[1.05] active:scale-[0.95] ${lastPoppedKey === `ik-${chainKey}` ? 'animate-pop' : ''} ${activeIKChain === chainKey ? 'bg-accent-purple text-paper border-accent-purple shadow-lg scale-[1.05]' : 'bg-paper/10 border-ridge text-mono-light'}`}
+                    >
+                      {`${chainKey.replace('_', ' ').toUpperCase()} IK ${activeIKChain === chainKey ? 'ON' : 'OFF'}`}
+                    </button>
+                  ))}
+                </div>
+
               </div>
             )}
           </div>
@@ -551,7 +662,7 @@ const App: React.FC = () => {
           </div>
         )}
         
-        <svg viewBox="-500 -700 1000 1400" className="w-full h-full overflow-visible relative z-10 drop-shadow-2xl">
+        <svg viewBox="-500 -700 1000 1400" className="w-full h-full overflow-visible relative z-10 drop-shadow-2xl" ref={svgRef}>
           <g transform={`translate(${pinOffset.x}, ${mannequinOffsetY + pinOffset.y})`}>
             <Mannequin 
               pose={RESTING_BASE_POSE} 
@@ -560,7 +671,7 @@ const App: React.FC = () => {
               showPivots={showPivots && isCalibrated} 
               showLabels={showLabels} 
               baseUnitH={baseH} 
-              onAnchorMouseDown={(k, x) => { setDraggingBoneKey(k); dragStartXRef.current = x; dragStartPivotOffsetRef.current = pivotOffsets[k]; }} 
+              onAnchorMouseDown={(k, clientX, clientY) => handleAnchorMouseDown(k, clientX, clientY, svgRef.current)} 
               draggingBoneKey={draggingBoneKey} 
               isPaused={true} 
               pinningMode={pinningMode} 
@@ -568,6 +679,9 @@ const App: React.FC = () => {
               isReversed={isReversed}
               jointModes={jointModes}
             />
+             {ikTargetWorldPosRef.current && activeIKChain && (
+              <circle cx={ikTargetWorldPosRef.current.x} cy={ikTargetWorldPosRef.current.y} r={10} fill="none" stroke="blue" strokeWidth="2" strokeDasharray="5,5" />
+            )}
           </g>
           {anomaly && (
             <g transform={`translate(${anomaly.x}, ${anomaly.y})`}>

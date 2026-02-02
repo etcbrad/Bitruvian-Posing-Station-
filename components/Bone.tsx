@@ -1,4 +1,5 @@
 
+
 import React from 'react';
 import { Vector2D, WalkingEnginePivotOffsets, WalkingEngineProportions } from '../types';
 
@@ -17,7 +18,7 @@ export interface BoneProps {
   label?: string;
   boneKey?: keyof WalkingEnginePivotOffsets; 
   proportionKey?: keyof WalkingEngineProportions; 
-  onAnchorMouseDown?: (boneKey: keyof WalkingEnginePivotOffsets, clientX: number) => void;
+  onAnchorMouseDown?: (boneKey: keyof WalkingEnginePivotOffsets, clientX: number, clientY: number) => void;
   isBeingDragged?: boolean;
   isPausedAndPivotsVisible?: boolean;
   patternFillId?: string;
@@ -127,7 +128,7 @@ export const Bone: React.FC<BoneProps> = ({
   const handleInteractionStart = (e: React.MouseEvent) => {
     if (isPausedAndPivotsVisible && boneKey && onAnchorMouseDown) {
       e.stopPropagation();
-      onAnchorMouseDown(boneKey, e.clientX);
+      onAnchorMouseDown(boneKey, e.clientX, e.clientY); // Pass clientY
     }
   };
 

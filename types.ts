@@ -1,4 +1,5 @@
 
+
 export type Vector2D = { x: number; y: number; };
 
 export type MaskTransform = {
@@ -61,3 +62,22 @@ export type WalkingEngineProportions = {
   r_foot: { w: number; h: number };
   r_toe: { w: number; h: number };
 };
+
+export type IKChainKey = 'right_arm' | 'left_arm' | 'right_leg' | 'left_leg';
+
+export interface FABRIKBone {
+  key: keyof WalkingEnginePivotOffsets; // The bone's pivotOffsets key
+  propKey: keyof WalkingEngineProportions; // The bone's proportion key
+  rawH: number; // Raw anatomical height for length calculation
+  parentOffsetAngle: number; // The fixed angle offset relative to parent's local axis (e.g., 90 for arms, 180 for legs)
+}
+
+export interface FABRIKChainConfig {
+  bones: FABRIKBone[];
+  rootParentPropKey: keyof WalkingEngineProportions; // The parent bone key where this IK chain attaches (e.g., 'collar' for arm)
+  rootJointOffset: Vector2D; // Position offset of the chain's root joint from its parent's origin (e.g., shoulder joint offset from collar)
+  rootParentRotationOffset: number; // The fixed rotation of the parent part that affects the first bone's base rotation (e.g., 90 or -90 for arms relative to collar)
+  endEffectorBoneKey: keyof WalkingEnginePivotOffsets; // The pivotOffsets key of the end effector bone (e.g., 'r_hand')
+  endEffectorPropKey: keyof WalkingEngineProportions; // The proportion key of the end effector (e.g., 'r_hand')
+  endEffectorRawH: number; // Raw height of the end effector for its last segment length
+}
